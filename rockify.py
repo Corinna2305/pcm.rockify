@@ -5,20 +5,29 @@ Created on Thu Mar  5 17:16:42 2026
 @author: corin
 """
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Header
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Header, Request
 from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, DateTime, Text, Boolean, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
+from collections import deque
 import os
 import shutil
 import re
 import secrets
 import hashlib
+import json
+import time
+from threading import Lock
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 # ==============================
 # CONFIG
@@ -37,9 +46,35 @@ LOCK_MINUTES = 15
 ACCESS_SESSION_HOURS = 12
 REFRESH_SESSION_DAYS = 14
 
+RADIO_BROWSER_BASE_URL = os.getenv("RADIO_BROWSER_BASE_URL", "https://all.api.radio-browser.info")
+RADIO_CACHE_TTL_SECONDS = 300
+RADIO_CACHE = {}
+
+# Security defaults: can be overridden in Render env vars.
+DEFAULT_CORS_ORIGINS = "http://127.0.0.1:8000,http://localhost:8000"
+CORS_ALLOW_ORIGINS = [origin.strip() for origin in os.getenv("CORS_ALLOW_ORIGINS", DEFAULT_CORS_ORIGINS).split(",") if origin.strip()]
+TRUSTED_HOSTS = [host.strip() for host in os.getenv("TRUSTED_HOSTS", "127.0.0.1,localhost,.onrender.com").split(",") if host.strip()]
+
+# Simple in-memory limiter. Good baseline for single-instance deployment.
+RATE_LIMIT_STATE = {}
+RATE_LIMIT_LOCK = Lock()
+
 app = FastAPI(
     title="Rockyfi API",
     docs_url=None,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=TRUSTED_HOSTS,
 )
 
 DOCS_CUSTOM_CSS = """
@@ -334,6 +369,111 @@ def hash_session_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def enforce_ip_rate_limit(request: Request, bucket: str, max_requests: int, window_seconds: int):
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    key = (bucket, ip)
+
+    with RATE_LIMIT_LOCK:
+        entries = RATE_LIMIT_STATE.get(key)
+        if entries is None:
+            entries = deque()
+            RATE_LIMIT_STATE[key] = entries
+
+        while entries and entries[0] <= now - window_seconds:
+            entries.popleft()
+
+        if len(entries) >= max_requests:
+            retry_after = int(window_seconds - (now - entries[0])) if entries else window_seconds
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many requests. Retry in about {max(retry_after, 1)} seconds",
+            )
+
+        entries.append(now)
+
+
+def parse_float(value):
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_world_radios(name: str, country: str, tag: str, limit: int, https_only: bool):
+    cache_key = (name.strip().lower(), country.strip().lower(), tag.strip().lower(), limit, https_only)
+    now = time.time()
+    cache_entry = RADIO_CACHE.get(cache_key)
+    if cache_entry and cache_entry["expires_at"] > now:
+        return cache_entry["data"]
+
+    params = {
+        "name": name.strip(),
+        "country": country.strip(),
+        "tag": tag.strip(),
+        "hidebroken": "true",
+        "order": "clickcount",
+        "reverse": "true",
+        "limit": str(limit),
+    }
+
+    query = urlencode({k: v for k, v in params.items() if v})
+    url = f"{RADIO_BROWSER_BASE_URL}/json/stations/search?{query}"
+
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Rockify/1.0 (+https://render.com)",
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        with urlopen(req, timeout=12) as response:
+            stations = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError) as exc:
+        raise HTTPException(status_code=503, detail=f"Radio service unavailable: {exc}")
+
+    normalized = []
+    for station in stations:
+        stream_url = station.get("url_resolved") or station.get("url") or ""
+        if https_only and not stream_url.lower().startswith("https://"):
+            continue
+
+        lat = parse_float(station.get("geo_lat"))
+        lon = parse_float(station.get("geo_long"))
+        if lat is None or lon is None:
+            continue
+
+        normalized.append(
+            {
+                "id": station.get("stationuuid"),
+                "name": station.get("name") or "Unknown station",
+                "country": station.get("country") or "Unknown",
+                "state": station.get("state") or "",
+                "city": station.get("city") or "",
+                "tags": station.get("tags") or "",
+                "language": station.get("language") or "",
+                "favicon": station.get("favicon") or "",
+                "stream_url": stream_url,
+                "homepage": station.get("homepage") or "",
+                "codec": station.get("codec") or "",
+                "bitrate": station.get("bitrate") or 0,
+                "votes": station.get("votes") or 0,
+                "lat": lat,
+                "lon": lon,
+            }
+        )
+
+    RADIO_CACHE[cache_key] = {
+        "expires_at": now + RADIO_CACHE_TTL_SECONDS,
+        "data": normalized,
+    }
+    return normalized
+
+
 def issue_session_token(user_id: int, db: Session):
     plain_token = secrets.token_urlsafe(32)
     session = UserSession(
@@ -625,6 +765,7 @@ def root():
                 <div class="cta-list">
                     <a class="cta" href="/docs">Apri Swagger Docs</a>
                     <a class="cta secondary" href="/redoc">Apri ReDoc</a>
+                    <a class="cta secondary" href="/world-radio">Mappa 3D Radio Mondo</a>
                     <a class="cta secondary" href="/songs">Test rapido: GET /songs</a>
                 </div>
 
@@ -644,11 +785,14 @@ def root():
 # ------------------------------
 
 @app.post("/register")
-def register(username: str = Form(...),
+def register(request: Request,
+             username: str = Form(...),
              email: str = Form(...),
              password: str = Form(...),
              role: str = Form("user"),
              db: Session = Depends(get_db)):
+
+    enforce_ip_rate_limit(request, "register", max_requests=15, window_seconds=60)
 
     email_norm = normalize_email(email)
     existing = db.query(User).filter(func.lower(User.email) == email_norm).first()
@@ -679,7 +823,9 @@ def register(username: str = Form(...),
 
 
 @app.post("/login")
-def login(email: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
+def login(request: Request, email: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
+    enforce_ip_rate_limit(request, "login", max_requests=20, window_seconds=60)
+
     email_norm = normalize_email(email)
     now = datetime.utcnow()
 
@@ -719,7 +865,9 @@ def login(email: str = Form(...), password: str = Form(...), db: Session = Depen
 
 
 @app.post("/refresh-token")
-def refresh_token(refresh_token: str = Form(...), db: Session = Depends(get_db)):
+def refresh_token(request: Request, refresh_token: str = Form(...), db: Session = Depends(get_db)):
+    enforce_ip_rate_limit(request, "refresh", max_requests=40, window_seconds=60)
+
     user, current_refresh_session = get_user_from_refresh_token(refresh_token, db)
 
     # Rotate refresh token: old one is revoked immediately.
@@ -878,6 +1026,459 @@ def add_radio(name: str = Form(...),
 @app.get("/radios")
 def list_radios(db: Session = Depends(get_db)):
     return db.query(Radio).all()
+
+
+@app.get("/api/world-radios")
+def world_radios(
+    request: Request,
+    name: str = "",
+    country: str = "",
+    tag: str = "",
+    limit: int = 200,
+    https_only: bool = True,
+):
+    enforce_ip_rate_limit(request, "world_radios", max_requests=60, window_seconds=60)
+
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
+
+    stations = fetch_world_radios(
+        name=name,
+        country=country,
+        tag=tag,
+        limit=limit,
+        https_only=https_only,
+    )
+    return {
+        "count": len(stations),
+        "filters": {
+            "name": name,
+            "country": country,
+            "tag": tag,
+            "limit": limit,
+            "https_only": https_only,
+        },
+        "stations": stations,
+    }
+
+
+@app.get("/world-radio", response_class=HTMLResponse)
+def world_radio_page():
+    return """
+    <!DOCTYPE html>
+    <html lang="it">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Rockify World Radio</title>
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&display=swap" rel="stylesheet">
+        <style>
+            :root {
+                --bg-1: #00111f;
+                --bg-2: #13334e;
+                --panel: rgba(3, 16, 31, 0.72);
+                --line: rgba(151, 214, 242, 0.35);
+                --ink: #e9f7ff;
+                --muted: #9ab7c8;
+                --accent: #5ad8ff;
+                --accent-2: #ffd166;
+                --danger: #ff7b72;
+            }
+
+            * { box-sizing: border-box; }
+
+            body {
+                margin: 0;
+                min-height: 100vh;
+                color: var(--ink);
+                font-family: "Sora", sans-serif;
+                background:
+                    radial-gradient(circle at 12% 18%, rgba(90, 216, 255, 0.20), transparent 36%),
+                    radial-gradient(circle at 88% 82%, rgba(255, 209, 102, 0.16), transparent 32%),
+                    linear-gradient(150deg, var(--bg-1), var(--bg-2));
+            }
+
+            .wrap {
+                max-width: 1380px;
+                margin: 0 auto;
+                padding: 20px;
+                display: grid;
+                grid-template-columns: 380px minmax(0, 1fr);
+                gap: 16px;
+            }
+
+            .panel {
+                background: var(--panel);
+                border: 1px solid var(--line);
+                border-radius: 20px;
+                backdrop-filter: blur(8px);
+                box-shadow: 0 16px 34px rgba(0, 0, 0, 0.24);
+            }
+
+            .controls {
+                padding: 18px;
+                display: grid;
+                gap: 12px;
+                align-content: start;
+                max-height: calc(100vh - 40px);
+                overflow: auto;
+            }
+
+            .title {
+                margin: 0;
+                font-size: 24px;
+                line-height: 1.1;
+            }
+
+            .subtitle {
+                margin: 0;
+                color: var(--muted);
+                font-size: 13px;
+                line-height: 1.45;
+            }
+
+            .grid {
+                display: grid;
+                gap: 8px;
+            }
+
+            label {
+                font-size: 12px;
+                color: var(--muted);
+                letter-spacing: 0.03em;
+            }
+
+            input {
+                width: 100%;
+                border: 1px solid var(--line);
+                background: rgba(8, 31, 52, 0.75);
+                color: var(--ink);
+                border-radius: 10px;
+                padding: 10px;
+                font: inherit;
+            }
+
+            input:focus {
+                outline: none;
+                border-color: var(--accent);
+                box-shadow: 0 0 0 3px rgba(90, 216, 255, 0.2);
+            }
+
+            .actions {
+                display: flex;
+                gap: 8px;
+            }
+
+            button {
+                flex: 1;
+                border: none;
+                border-radius: 10px;
+                padding: 11px;
+                font: inherit;
+                font-weight: 700;
+                cursor: pointer;
+                color: #082439;
+                background: linear-gradient(120deg, var(--accent), #9fe7ff);
+            }
+
+            button.secondary {
+                background: linear-gradient(120deg, var(--accent-2), #ffedab);
+            }
+
+            .status {
+                font-size: 12px;
+                color: var(--muted);
+                min-height: 18px;
+            }
+
+            .status.error { color: var(--danger); }
+
+            .player {
+                border: 1px solid var(--line);
+                border-radius: 12px;
+                background: rgba(9, 27, 46, 0.75);
+                padding: 10px;
+                display: grid;
+                gap: 6px;
+            }
+
+            .station-name {
+                font-size: 16px;
+                font-weight: 700;
+                line-height: 1.2;
+            }
+
+            .station-meta {
+                font-size: 12px;
+                color: var(--muted);
+            }
+
+            audio {
+                width: 100%;
+                height: 36px;
+            }
+
+            .list {
+                margin: 0;
+                padding: 0;
+                list-style: none;
+                display: grid;
+                gap: 8px;
+                max-height: 44vh;
+                overflow: auto;
+            }
+
+            .list button {
+                width: 100%;
+                text-align: left;
+                color: var(--ink);
+                background: rgba(13, 38, 60, 0.8);
+                border: 1px solid var(--line);
+                padding: 10px;
+                font-weight: 600;
+            }
+
+            .list button:hover { border-color: var(--accent); }
+
+            .list .line {
+                display: block;
+                font-size: 11px;
+                font-weight: 400;
+                color: var(--muted);
+                margin-top: 3px;
+            }
+
+            .globe-panel {
+                position: relative;
+                height: calc(100vh - 40px);
+                min-height: 560px;
+                overflow: hidden;
+            }
+
+            #globe {
+                width: 100%;
+                height: 100%;
+                min-height: 100%;
+            }
+
+            #globe canvas {
+                display: block;
+            }
+
+            .legend {
+                position: absolute;
+                right: 14px;
+                bottom: 14px;
+                border: 1px solid var(--line);
+                border-radius: 10px;
+                padding: 8px 10px;
+                background: rgba(5, 19, 33, 0.72);
+                font-size: 12px;
+                color: var(--muted);
+            }
+
+            @media (max-width: 1020px) {
+                .wrap {
+                    grid-template-columns: 1fr;
+                    padding: 12px;
+                }
+
+                .controls {
+                    max-height: none;
+                }
+
+                .globe-panel {
+                    height: 62vh;
+                    min-height: 430px;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <main class="wrap">
+            <section class="panel controls">
+                <h1 class="title">World Radio Globe</h1>
+                <p class="subtitle">
+                    Cerca emittenti gratis da tutto il mondo usando Radio Browser,
+                    clicca un punto sul globo e ascolta subito lo stream.
+                </p>
+
+                <div class="grid">
+                    <label for="country">Paese</label>
+                    <input id="country" type="text" placeholder="Es: Italy, Japan, Brazil">
+                </div>
+
+                <div class="grid">
+                    <label for="name">Nome radio</label>
+                    <input id="name" type="text" placeholder="Es: Rock, Jazz FM, BBC">
+                </div>
+
+                <div class="grid">
+                    <label for="tag">Genere/Tag</label>
+                    <input id="tag" type="text" placeholder="Es: rock, pop, classical">
+                </div>
+
+                <div class="actions">
+                    <button id="searchBtn">Cerca</button>
+                    <button id="randomBtn" class="secondary" type="button">Random</button>
+                </div>
+
+                <div id="status" class="status"></div>
+
+                <section class="player">
+                    <div id="stationName" class="station-name">Nessuna radio selezionata</div>
+                    <div id="stationMeta" class="station-meta">Seleziona un punto sul globo o dalla lista.</div>
+                    <audio id="audio" controls preload="none"></audio>
+                </section>
+
+                <ul id="stationList" class="list"></ul>
+            </section>
+
+            <section class="panel globe-panel">
+                <div id="globe"></div>
+                <div class="legend">Punti luminosi: stazioni disponibili via HTTPS</div>
+            </section>
+        </main>
+
+        <script src="https://unpkg.com/globe.gl"></script>
+        <script>
+            const globeContainer = document.getElementById('globe');
+            const countryInput = document.getElementById('country');
+            const nameInput = document.getElementById('name');
+            const tagInput = document.getElementById('tag');
+            const statusEl = document.getElementById('status');
+            const stationListEl = document.getElementById('stationList');
+            const stationNameEl = document.getElementById('stationName');
+            const stationMetaEl = document.getElementById('stationMeta');
+            const audioEl = document.getElementById('audio');
+
+            let stations = [];
+
+            const globe = Globe()(globeContainer)
+                .globeImageUrl('https://unpkg.com/three-globe/example/img/earth-blue-marble.jpg')
+                .bumpImageUrl('https://unpkg.com/three-globe/example/img/earth-topology.png')
+                .backgroundColor('rgba(0,0,0,0)')
+                .showAtmosphere(true)
+                .atmosphereColor('#6ecbff')
+                .atmosphereAltitude(0.18)
+                .pointLat('lat')
+                .pointLng('lon')
+                .pointLabel((d) => `${d.name}<br>${d.country}${d.city ? ' - ' + d.city : ''}`)
+                .pointAltitude(0.013)
+                .pointRadius(0.34)
+                .pointColor(() => '#5ad8ff')
+                .pointResolution(8)
+                .onPointClick((station) => {
+                    if (station) {
+                        playStation(station);
+                    }
+                });
+
+            function syncGlobeSize() {
+                globe.width(globeContainer.clientWidth);
+                globe.height(globeContainer.clientHeight);
+            }
+
+            syncGlobeSize();
+            window.addEventListener('resize', syncGlobeSize);
+
+            globe.controls().autoRotate = true;
+            globe.controls().autoRotateSpeed = 0.35;
+            globe.controls().enablePan = false;
+            globe.controls().zoomSpeed = 1.2;
+            globe.controls().minDistance = 120;
+            globe.controls().maxDistance = 700;
+            globe.pointOfView({ lat: 16, lng: 9, altitude: 1.65 }, 0);
+
+            function setStatus(text, isError = false) {
+                statusEl.textContent = text;
+                statusEl.classList.toggle('error', isError);
+            }
+
+            function renderList(max = 25) {
+                stationListEl.innerHTML = '';
+                stations.slice(0, max).forEach((station) => {
+                    const li = document.createElement('li');
+                    const btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.innerHTML =
+                        `${station.name}<span class="line">${station.country} ${station.city ? ' - ' + station.city : ''} ${station.tags ? ' - ' + station.tags : ''}</span>`;
+                    btn.addEventListener('click', () => playStation(station));
+                    li.appendChild(btn);
+                    stationListEl.appendChild(li);
+                });
+            }
+
+            function playStation(station) {
+                stationNameEl.textContent = station.name;
+                stationMetaEl.textContent = `${station.country}${station.city ? ' - ' + station.city : ''}${station.tags ? ' - ' + station.tags : ''}`;
+                audioEl.src = station.stream_url;
+                audioEl.play().catch(() => {
+                    setStatus('Play bloccato dal browser: clicca Play nel player audio.', false);
+                });
+            }
+
+            async function searchStations() {
+                const params = new URLSearchParams({
+                    country: countryInput.value.trim(),
+                    name: nameInput.value.trim(),
+                    tag: tagInput.value.trim(),
+                    limit: '220',
+                    https_only: 'true',
+                });
+
+                setStatus('Ricerca stazioni globali in corso...');
+
+                try {
+                    const response = await fetch(`/api/world-radios?${params.toString()}`);
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+
+                    const payload = await response.json();
+                    stations = payload.stations || [];
+
+                    globe.pointsData(stations);
+                    renderList();
+
+                    if (stations.length === 0) {
+                        setStatus('Nessuna stazione trovata con questi filtri.', true);
+                    } else {
+                        setStatus(`Trovate ${stations.length} stazioni (con stream HTTPS).`);
+                    }
+                } catch (err) {
+                    console.error(err);
+                    setStatus('Errore durante la ricerca radio. Riprova tra poco.', true);
+                }
+            }
+
+            document.getElementById('searchBtn').addEventListener('click', searchStations);
+
+            document.getElementById('randomBtn').addEventListener('click', () => {
+                if (!stations.length) {
+                    setStatus('Prima fai una ricerca, poi puoi usare Random.', true);
+                    return;
+                }
+                const randomStation = stations[Math.floor(Math.random() * stations.length)];
+                playStation(randomStation);
+            });
+
+            [countryInput, nameInput, tagInput].forEach((input) => {
+                input.addEventListener('keydown', (event) => {
+                    if (event.key === 'Enter') {
+                        searchStations();
+                    }
+                });
+            });
+
+            tagInput.value = 'rock';
+            searchStations();
+        </script>
+    </body>
+    </html>
+    """
 
 # ------------------------------
 # CREATE EVENT
