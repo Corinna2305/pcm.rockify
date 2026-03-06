@@ -26,7 +26,7 @@ import json
 import time
 from threading import Lock
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import URLError, HTTPError
 
 # ==============================
@@ -422,7 +422,7 @@ def fetch_world_radios(name: str, country: str, tag: str, limit: int, https_only
     query = urlencode({k: v for k, v in params.items() if v})
     url = f"{RADIO_BROWSER_BASE_URL}/json/stations/search?{query}"
 
-    req = Request(
+    req = UrlRequest(
         url,
         headers={
             "User-Agent": "Rockify/1.0 (+https://render.com)",
