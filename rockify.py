@@ -5,17 +5,20 @@ Created on Thu Mar  5 17:16:42 2026
 @author: corin
 """
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Header
 from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse
-from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, DateTime, Text
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, DateTime, Text, Boolean, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from passlib.context import CryptContext
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import shutil
+import re
+import secrets
+import hashlib
 
 # ==============================
 # CONFIG
@@ -28,6 +31,11 @@ SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"])
+
+MAX_FAILED_LOGIN_ATTEMPTS = 5
+LOCK_MINUTES = 15
+ACCESS_SESSION_HOURS = 12
+REFRESH_SESSION_DAYS = 14
 
 app = FastAPI(
     title="Rockyfi API",
@@ -253,6 +261,34 @@ class Post(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class LoginGuard(Base):
+    __tablename__ = "login_guards"
+    id = Column(Integer, primary_key=True)
+    email = Column(String, unique=True, index=True)
+    failed_attempts = Column(Integer, default=0)
+    locked_until = Column(DateTime, nullable=True)
+
+
+class UserSession(Base):
+    __tablename__ = "user_sessions"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    token_hash = Column(String, unique=True, index=True)
+    expires_at = Column(DateTime)
+    revoked = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class RefreshSession(Base):
+    __tablename__ = "refresh_sessions"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    token_hash = Column(String, unique=True, index=True)
+    expires_at = Column(DateTime)
+    revoked = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 Base.metadata.create_all(bind=engine)
 
 # ==============================
@@ -275,6 +311,105 @@ def hash_password(password: str):
 
 def verify_password(password: str, hashed: str):
     return pwd_context.verify(password, hashed)
+
+
+def normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def validate_password_strength(password: str) -> bool:
+    # Minimum 8 chars with upper/lower/digit/special to reduce weak credentials.
+    if len(password) < 8:
+        return False
+    checks = [
+        r"[A-Z]",
+        r"[a-z]",
+        r"\d",
+        r"[^A-Za-z0-9]",
+    ]
+    return all(re.search(pattern, password) for pattern in checks)
+
+
+def hash_session_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def issue_session_token(user_id: int, db: Session):
+    plain_token = secrets.token_urlsafe(32)
+    session = UserSession(
+        user_id=user_id,
+        token_hash=hash_session_token(plain_token),
+        expires_at=datetime.utcnow() + timedelta(hours=ACCESS_SESSION_HOURS),
+        revoked=False,
+    )
+    db.add(session)
+    db.commit()
+    return plain_token, session.expires_at
+
+
+def issue_refresh_token(user_id: int, db: Session):
+    plain_token = secrets.token_urlsafe(48)
+    session = RefreshSession(
+        user_id=user_id,
+        token_hash=hash_session_token(plain_token),
+        expires_at=datetime.utcnow() + timedelta(days=REFRESH_SESSION_DAYS),
+        revoked=False,
+    )
+    db.add(session)
+    db.commit()
+    return plain_token, session.expires_at
+
+
+def get_user_from_bearer(authorization: str, db: Session):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+
+    raw_token = authorization.split(" ", 1)[1].strip()
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
+
+    token_hash = hash_session_token(raw_token)
+    session = (
+        db.query(UserSession)
+        .filter(
+            UserSession.token_hash == token_hash,
+            UserSession.revoked == False,
+            UserSession.expires_at > datetime.utcnow(),
+        )
+        .first()
+    )
+
+    if not session:
+        raise HTTPException(status_code=401, detail="Session expired or invalid")
+
+    user = db.query(User).filter(User.id == session.user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found for this session")
+    return user, session
+
+
+def get_user_from_refresh_token(refresh_token: str, db: Session):
+    if not refresh_token or not refresh_token.strip():
+        raise HTTPException(status_code=401, detail="Missing refresh token")
+
+    token_hash = hash_session_token(refresh_token.strip())
+    refresh_session = (
+        db.query(RefreshSession)
+        .filter(
+            RefreshSession.token_hash == token_hash,
+            RefreshSession.revoked == False,
+            RefreshSession.expires_at > datetime.utcnow(),
+        )
+        .first()
+    )
+
+    if not refresh_session:
+        raise HTTPException(status_code=401, detail="Refresh token expired or invalid")
+
+    user = db.query(User).filter(User.id == refresh_session.user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found for this refresh token")
+    return user, refresh_session
 
 # ==============================
 # ROUTES
@@ -515,21 +650,131 @@ def register(username: str = Form(...),
              role: str = Form("user"),
              db: Session = Depends(get_db)):
 
-    existing = db.query(User).filter(User.email == email).first()
+    email_norm = normalize_email(email)
+    existing = db.query(User).filter(func.lower(User.email) == email_norm).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
+    if not validate_password_strength(password):
+        raise HTTPException(
+            status_code=400,
+            detail="Weak password: use at least 8 chars with upper, lower, number and symbol",
+        )
+
+    role_norm = role.strip().lower()
+    if role_norm not in {"user", "artist"}:
+        raise HTTPException(status_code=400, detail="Invalid role. Allowed: user, artist")
+
     user = User(
         username=username,
-        email=email,
+        email=email_norm,
         password=hash_password(password),
-        role=role
+        role=role_norm
     )
 
     db.add(user)
     db.commit()
     db.refresh(user)
     return {"message": "User created successfully"}
+
+
+@app.post("/login")
+def login(email: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
+    email_norm = normalize_email(email)
+    now = datetime.utcnow()
+
+    guard = db.query(LoginGuard).filter(LoginGuard.email == email_norm).first()
+    if not guard:
+        guard = LoginGuard(email=email_norm, failed_attempts=0, locked_until=None)
+        db.add(guard)
+        db.commit()
+        db.refresh(guard)
+
+    if guard.locked_until and guard.locked_until > now:
+        remaining = int((guard.locked_until - now).total_seconds() // 60) + 1
+        raise HTTPException(status_code=423, detail=f"Account temporarily locked. Retry in {remaining} min")
+
+    user = db.query(User).filter(func.lower(User.email) == email_norm).first()
+    if not user or not verify_password(password, user.password):
+        guard.failed_attempts += 1
+        if guard.failed_attempts >= MAX_FAILED_LOGIN_ATTEMPTS:
+            guard.locked_until = now + timedelta(minutes=LOCK_MINUTES)
+            guard.failed_attempts = 0
+        db.commit()
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    guard.failed_attempts = 0
+    guard.locked_until = None
+    access_token, access_expires_at = issue_session_token(user.id, db)
+    refresh_token, refresh_expires_at = issue_refresh_token(user.id, db)
+    db.refresh(guard)
+    return {
+        "message": "Login successful",
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_at": access_expires_at.isoformat(),
+        "refresh_token": refresh_token,
+        "refresh_expires_at": refresh_expires_at.isoformat(),
+    }
+
+
+@app.post("/refresh-token")
+def refresh_token(refresh_token: str = Form(...), db: Session = Depends(get_db)):
+    user, current_refresh_session = get_user_from_refresh_token(refresh_token, db)
+
+    # Rotate refresh token: old one is revoked immediately.
+    current_refresh_session.revoked = True
+    db.commit()
+
+    access_token, access_expires_at = issue_session_token(user.id, db)
+    new_refresh_token, refresh_expires_at = issue_refresh_token(user.id, db)
+
+    return {
+        "message": "Token refreshed",
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_at": access_expires_at.isoformat(),
+        "refresh_token": new_refresh_token,
+        "refresh_expires_at": refresh_expires_at.isoformat(),
+    }
+
+
+@app.get("/me")
+def me(authorization: str = Header(None, alias="Authorization"), db: Session = Depends(get_db)):
+    user, session = get_user_from_bearer(authorization or "", db)
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "role": user.role,
+        "session_expires_at": session.expires_at.isoformat(),
+    }
+
+
+@app.post("/logout")
+def logout(authorization: str = Header(None, alias="Authorization"), db: Session = Depends(get_db)):
+    _, session = get_user_from_bearer(authorization, db)
+    session.revoked = True
+    db.commit()
+    return {"message": "Logout successful"}
+
+
+@app.post("/logout-all")
+def logout_all(authorization: str = Header(None, alias="Authorization"), db: Session = Depends(get_db)):
+    user, _ = get_user_from_bearer(authorization, db)
+
+    db.query(UserSession).filter(
+        UserSession.user_id == user.id,
+        UserSession.revoked == False,
+    ).update({"revoked": True}, synchronize_session=False)
+
+    db.query(RefreshSession).filter(
+        RefreshSession.user_id == user.id,
+        RefreshSession.revoked == False,
+    ).update({"revoked": True}, synchronize_session=False)
+
+    db.commit()
+    return {"message": "All sessions revoked"}
 
 # ------------------------------
 # CREATE ARTIST PROFILE
