@@ -74,6 +74,61 @@ body {
     box-shadow: 0 8px 22px rgba(31, 41, 64, 0.05);
 }
 
+.swagger-ui .opblock .opblock-summary-method {
+    font-weight: 700;
+}
+
+.swagger-ui .opblock-get {
+    border-color: #d8b074;
+    background: rgba(245, 208, 145, 0.18);
+}
+
+.swagger-ui .opblock-get .opblock-summary-method {
+    background: #c38b2b;
+}
+
+.swagger-ui .opblock-post {
+    border-color: #d47898;
+    background: rgba(221, 94, 137, 0.14);
+}
+
+.swagger-ui .opblock-post .opblock-summary-method {
+    background: #b34b72;
+}
+
+.swagger-ui .opblock-put {
+    border-color: #cf8b56;
+    background: rgba(214, 136, 72, 0.14);
+}
+
+.swagger-ui .opblock-put .opblock-summary-method {
+    background: #b4682e;
+}
+
+.swagger-ui .opblock-delete {
+    border-color: #cf7a7a;
+    background: rgba(201, 98, 98, 0.14);
+}
+
+.swagger-ui .opblock-delete .opblock-summary-method {
+    background: #b94f4f;
+}
+
+.swagger-ui .opblock .opblock-summary-path,
+.swagger-ui .opblock .opblock-summary-description {
+    color: #3f2f4f;
+}
+
+.swagger-ui .btn.try-out__btn {
+    border-color: #b34b72;
+    color: #b34b72;
+}
+
+.swagger-ui .btn.cancel {
+    border-color: #9c6a3a;
+    color: #9c6a3a;
+}
+
 .swagger-ui .btn.execute {
     background: linear-gradient(120deg, #dd5e89, #f7bb97);
     border-color: #dd5e89;
