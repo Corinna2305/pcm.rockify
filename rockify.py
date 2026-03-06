@@ -6,6 +6,7 @@ Created on Thu Mar  5 17:16:42 2026
 """
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, DateTime, Text
@@ -28,7 +29,99 @@ Base = declarative_base()
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"])
 
-app = FastAPI(title="Rockyfi API")
+app = FastAPI(
+    title="Rockyfi API",
+    docs_url=None,
+)
+
+DOCS_CUSTOM_CSS = """
+body {
+    background: radial-gradient(circle at 10% 10%, #ffe0ef 0%, transparent 28%),
+                radial-gradient(circle at 90% 90%, #ffe9d6 0%, transparent 30%),
+                #f7f2ea;
+}
+
+.swagger-ui .topbar {
+    background: linear-gradient(120deg, #dd5e89, #f7bb97);
+    border-bottom: 1px solid #f3c6d8;
+}
+
+.swagger-ui .topbar .download-url-wrapper { display: none; }
+
+.swagger-ui .info {
+    margin: 18px 0;
+    padding: 20px;
+    border: 1px solid #e9dfd1;
+    border-radius: 14px;
+    background: #fffdfa;
+    box-shadow: 0 10px 28px rgba(31, 41, 64, 0.08);
+}
+
+.swagger-ui .info .title {
+    color: #1f2940;
+    font-weight: 700;
+}
+
+.swagger-ui .scheme-container {
+    border-radius: 12px;
+    border: 1px solid #e9dfd1;
+    background: #fffdfa;
+}
+
+.swagger-ui .opblock {
+    border-radius: 12px;
+    border-width: 1px;
+    box-shadow: 0 8px 22px rgba(31, 41, 64, 0.05);
+}
+
+.swagger-ui .btn.execute {
+    background: linear-gradient(120deg, #dd5e89, #f7bb97);
+    border-color: #dd5e89;
+}
+
+.swagger-ui input,
+.swagger-ui textarea,
+.swagger-ui select {
+    border-radius: 10px;
+}
+
+.swagger-ui .responses-inner h4,
+.swagger-ui .responses-inner h5 {
+    color: #1f2940;
+}
+
+#rockify-docs-hero {
+    margin: 16px 0 20px;
+    padding: 16px 18px;
+    border: 1px solid #e9dfd1;
+    border-radius: 12px;
+    background: #fff;
+    box-shadow: 0 8px 20px rgba(31, 41, 64, 0.06);
+    color: #5d6a84;
+    font-size: 14px;
+    line-height: 1.45;
+}
+
+#rockify-docs-hero strong {
+    color: #1f2940;
+}
+"""
+
+DOCS_CUSTOM_JS = """
+window.addEventListener('load', function () {
+  const infoBlock = document.querySelector('.swagger-ui .information-container .info');
+  if (!infoBlock || document.getElementById('rockify-docs-hero')) return;
+
+  const hero = document.createElement('div');
+  hero.id = 'rockify-docs-hero';
+  hero.innerHTML =
+    '<strong>Rockify Docs</strong><br>' +
+    'Suggerimento: usa il filtro in alto per cercare endpoint, poi clicca "Try it out" per test veloci. ' +
+    'Inizia da <code>GET /songs</code> e <code>POST /register</code>.';
+
+  infoBlock.appendChild(hero);
+});
+"""
 
 # Create upload folders
 os.makedirs("uploads/songs", exist_ok=True)
@@ -127,6 +220,33 @@ def verify_password(password: str, hashed: str):
 # ==============================
 # ROUTES
 # ==============================
+
+@app.get("/docs", include_in_schema=False)
+def custom_swagger_docs():
+    response = get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title="Rockify API Docs",
+        oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
+        swagger_ui_parameters={
+            "docExpansion": "list",
+            "defaultModelsExpandDepth": -1,
+            "displayRequestDuration": True,
+            "filter": True,
+            "persistAuthorization": True,
+            "tryItOutEnabled": True,
+            "syntaxHighlight.theme": "monokai",
+        },
+    )
+
+    html = response.body.decode("utf-8")
+    html = html.replace("</head>", f"<style>{DOCS_CUSTOM_CSS}</style></head>")
+    html = html.replace("</body>", f"<script>{DOCS_CUSTOM_JS}</script></body>")
+    return HTMLResponse(html)
+
+
+@app.get(app.swagger_ui_oauth2_redirect_url, include_in_schema=False)
+def swagger_redirect():
+    return get_swagger_ui_oauth2_redirect_html()
 
 @app.get("/", response_class=HTMLResponse)
 def root():
